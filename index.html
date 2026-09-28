@@ -15,191 +15,728 @@
     (function () {
       'use strict';
 
-      // Robust GitHub Pages -> Apps Script bridge.
-      // The browser NEVER receives Angel/Telegram credentials from this bridge.
+      // ========================================================================
+      // SHRI KUBER JI — GITHUB PAGES FRONTEND / APPS SCRIPT BACKEND BRIDGE
+      // FRONTEND BRIDGE v3.0 — RELIABLE + DIAGNOSTIC
+      //
+      // IMPORTANT:
+      // 1) The browser never receives Angel One / Telegram credentials.
+      // 2) Only the Apps Script Web App URL is kept in this file.
+      // 3) Real broker orders remain disabled by the backend DEMO/PAPER design.
+      // ========================================================================
+
       var requestSeq = 0;
       var pending = new Map();
       var queue = [];
+
       var bridgeReady = false;
       var iframe = null;
       var initStarted = false;
-      var BRIDGE_TIMEOUT_MS = 20000;
-      var BRIDGE_READY_TIMEOUT_MS = 15000;
+
+      var BRIDGE_TIMEOUT_MS = 30000;
+      var BRIDGE_READY_TIMEOUT_MS = 20000;
+      var READY_RETRY_MS = 1500;
+
+      window.SHRI_KUBER_BRIDGE_STATUS = {
+        ready: false,
+        iframeLoaded: false,
+        waitingForBridge: true,
+        version: '3.0',
+        error: ''
+      };
+
+
+      // ========================================================================
+      // FRONTEND BRIDGE LOGGER
+      // ========================================================================
+
+      function bridgeClientLog(level, message, meta) {
+        try {
+          var text = '[BRIDGE CLIENT] ' + level + ' ' + message;
+
+          if (meta !== undefined && meta !== null) {
+            try {
+              text += ' | ' + JSON.stringify(meta);
+            } catch (ignoreMeta) {}
+          }
+
+          console.log(text);
+
+          // Existing Candle Terminal logger, if it is already available.
+          if (typeof window.log === 'function') {
+            try {
+              window.log(
+                text,
+                level === 'ERROR'
+                  ? 'error'
+                  : level === 'WARN'
+                    ? 'warn'
+                    : level === 'SUCCESS'
+                      ? 'success'
+                      : 'info',
+                'BRIDGE'
+              );
+            } catch (ignoreTerminalLog) {}
+          }
+        } catch (ignore) {}
+      }
+
+
+      // ========================================================================
+      // URL CHECK
+      // ========================================================================
 
       function configured() {
-        var url = String(window.SHRI_KUBER_APPS_SCRIPT_URL || '').trim();
+        var url = String(
+          window.SHRI_KUBER_APPS_SCRIPT_URL || ''
+        ).trim();
+
         return /^https:\/\/script\.google\.com\/macros\/s\/[^\s]+\/exec(?:[?].*)?$/.test(url);
       }
 
       function appScriptUrl() {
-        return String(window.SHRI_KUBER_APPS_SCRIPT_URL || '').trim();
+        return String(
+          window.SHRI_KUBER_APPS_SCRIPT_URL || ''
+        ).trim();
       }
 
+
+      // ========================================================================
+      // SAFE FAILURE
+      // ========================================================================
+
       function failItem(item, error) {
-        try { if (item && typeof item.fail === 'function') item.fail(error); } catch (ignore) {}
+        try {
+          if (item && typeof item.fail === 'function') {
+            item.fail(error);
+          }
+        } catch (ignore) {}
       }
+
+
+      // ========================================================================
+      // REMOVE PENDING REQUEST
+      // ========================================================================
 
       function clearPending(requestId) {
         var item = pending.get(requestId);
-        if (item) pending.delete(requestId);
+
+        if (item) {
+          pending.delete(requestId);
+        }
+
         return item;
       }
 
+
+      // ========================================================================
+      // REQUEST TIMEOUT
+      // ========================================================================
+
       function timeoutRequest(requestId, fn) {
         var item = clearPending(requestId);
+
         if (!item) return;
+
+        bridgeClientLog(
+          'ERROR',
+          'Backend request timeout',
+          {
+            requestId: requestId,
+            fn: fn,
+            timeoutMs: BRIDGE_TIMEOUT_MS
+          }
+        );
+
         failItem(item, {
           name: 'BackendTimeout',
           code: 'BACKEND_TIMEOUT',
-          message: 'Apps Script backend request timed out after ' + BRIDGE_TIMEOUT_MS + ' ms: ' + fn
+          message:
+            'Apps Script backend request timed out after ' +
+            BRIDGE_TIMEOUT_MS +
+            ' ms: ' +
+            fn
         });
       }
 
-      function flushQueue() {
-        if (!bridgeReady || !iframe || !iframe.contentWindow) return;
 
-        while (queue.length) {
-          var item = queue.shift();
-          if (!pending.has(item.requestId)) continue;
+      // ========================================================================
+      // SEND REQUEST TO IFRAME
+      // ========================================================================
 
-          try {
-            iframe.contentWindow.postMessage({
+      function sendItem(item) {
+        if (
+          !bridgeReady ||
+          !iframe ||
+          !iframe.contentWindow
+        ) {
+          return false;
+        }
+
+        try {
+          bridgeClientLog(
+            'SEND',
+            'Sending request to Apps Script bridge',
+            {
+              requestId: item.requestId,
+              fn: item.fn
+            }
+          );
+
+          iframe.contentWindow.postMessage(
+            {
               type: 'SHRI_KUBER_CALL',
               requestId: item.requestId,
               fn: item.fn,
               args: item.args
-            }, '*');
+            },
+            '*'
+          );
 
-            item.timer = setTimeout(function (requestId, fn) {
-              return function () { timeoutRequest(requestId, fn); };
-            }(item.requestId, item.fn), BRIDGE_TIMEOUT_MS);
+          item.sentAt = Date.now();
 
-          } catch (e) {
-            var failed = clearPending(item.requestId);
-            failItem(failed || item, e);
-          }
+          item.timer = setTimeout(
+            (function (requestId, fn) {
+              return function () {
+                timeoutRequest(requestId, fn);
+              };
+            })(item.requestId, item.fn),
+            BRIDGE_TIMEOUT_MS
+          );
+
+          return true;
+
+        } catch (e) {
+          var failed = clearPending(item.requestId);
+
+          bridgeClientLog(
+            'ERROR',
+            'postMessage to bridge failed',
+            {
+              requestId: item.requestId,
+              fn: item.fn,
+              message: e && e.message
+                ? e.message
+                : String(e)
+            }
+          );
+
+          failItem(failed || item, e);
+
+          return false;
         }
       }
 
+
+      // ========================================================================
+      // FLUSH QUEUED REQUESTS
+      // ========================================================================
+
+      function flushQueue() {
+        if (
+          !bridgeReady ||
+          !iframe ||
+          !iframe.contentWindow
+        ) {
+          bridgeClientLog(
+            'DEBUG',
+            'flushQueue waiting for bridge',
+            {
+              bridgeReady: bridgeReady,
+              iframeExists: !!iframe,
+              iframeWindow: !!(
+                iframe &&
+                iframe.contentWindow
+              ),
+              queueLength: queue.length
+            }
+          );
+
+          return;
+        }
+
+        bridgeClientLog(
+          'INFO',
+          'Flushing backend request queue',
+          {
+            queueLength: queue.length
+          }
+        );
+
+        while (queue.length) {
+          var item = queue.shift();
+
+          if (!pending.has(item.requestId)) {
+            continue;
+          }
+
+          sendItem(item);
+        }
+      }
+
+
+      // ========================================================================
+      // CREATE APPS SCRIPT BRIDGE IFRAME
+      // ========================================================================
+
       function ensureBridge() {
-        if (initStarted) return;
+        if (initStarted) {
+          return;
+        }
+
         initStarted = true;
+
+        bridgeClientLog(
+          'INIT',
+          'Initializing Apps Script bridge',
+          {
+            url: appScriptUrl()
+          }
+        );
 
         if (!configured()) {
           window.SHRI_KUBER_BRIDGE_STATUS = {
             ready: false,
-            error: 'Apps Script Web App URL is not configured.'
+            iframeLoaded: false,
+            waitingForBridge: false,
+            version: '3.0',
+            error:
+              'Apps Script Web App URL is not configured.'
           };
+
+          bridgeClientLog(
+            'ERROR',
+            'Apps Script Web App URL is not configured'
+          );
+
           return;
         }
 
         iframe = document.createElement('iframe');
-        iframe.id = 'shriKuberAppsScriptBridge';
-        iframe.title = 'Backend bridge';
-        iframe.setAttribute('aria-hidden', 'true');
+
+        iframe.id =
+          'shriKuberAppsScriptBridge';
+
+        iframe.title =
+          'Shri Kuber Ji Backend Bridge';
+
+        iframe.setAttribute(
+          'aria-hidden',
+          'true'
+        );
+
         iframe.style.cssText =
-          'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;' +
-          'border:0;opacity:0;pointer-events:none;';
+          'position:fixed;' +
+          'left:-10000px;' +
+          'top:-10000px;' +
+          'width:1px;' +
+          'height:1px;' +
+          'border:0;' +
+          'opacity:0;' +
+          'pointer-events:none;';
 
         iframe.onload = function () {
           window.SHRI_KUBER_BRIDGE_STATUS = {
             ready: false,
             iframeLoaded: true,
-            waitingForBridge: true
+            waitingForBridge: true,
+            version: '3.0',
+            error: ''
           };
+
+          bridgeClientLog(
+            'LOAD',
+            'Apps Script bridge iframe loaded'
+          );
         };
 
         iframe.onerror = function () {
           window.SHRI_KUBER_BRIDGE_STATUS = {
             ready: false,
-            error: 'Apps Script bridge iframe failed to load.'
+            iframeLoaded: false,
+            waitingForBridge: false,
+            version: '3.0',
+            error:
+              'Apps Script bridge iframe failed to load.'
           };
+
+          bridgeClientLog(
+            'ERROR',
+            'Apps Script bridge iframe failed to load'
+          );
         };
 
         var url = appScriptUrl();
-        iframe.src = url +
+
+        iframe.src =
+          url +
           (url.indexOf('?') >= 0 ? '&' : '?') +
-          'bridge=1&_bridge=' + Date.now();
+          'bridge=1&_bridge=' +
+          Date.now();
 
-        document.documentElement.appendChild(iframe);
+        document.documentElement.appendChild(
+          iframe
+        );
 
-        setTimeout(function () {
-          if (!bridgeReady) {
-            window.SHRI_KUBER_BRIDGE_STATUS = {
-              ready: false,
-              error: 'Bridge did not become ready within ' + BRIDGE_READY_TIMEOUT_MS + ' ms.'
-            };
-          }
-        }, BRIDGE_READY_TIMEOUT_MS);
+        // If the bridge READY message is missed, the bridge itself
+        // sends READY again. This timeout is only a diagnostic marker.
+        setTimeout(
+          function () {
+            if (!bridgeReady) {
+              window.SHRI_KUBER_BRIDGE_STATUS = {
+                ready: false,
+                iframeLoaded: !!(
+                  iframe &&
+                  iframe.contentWindow
+                ),
+                waitingForBridge: false,
+                version: '3.0',
+                error:
+                  'Bridge did not become ready within ' +
+                  BRIDGE_READY_TIMEOUT_MS +
+                  ' ms.'
+              };
+
+              bridgeClientLog(
+                'ERROR',
+                'Bridge READY timeout',
+                {
+                  timeoutMs:
+                    BRIDGE_READY_TIMEOUT_MS,
+                  queueLength:
+                    queue.length
+                }
+              );
+            }
+          },
+          BRIDGE_READY_TIMEOUT_MS
+        );
       }
 
-      window.addEventListener('message', function (event) {
-        if (!iframe || event.source !== iframe.contentWindow) return;
 
-        var data = event.data || {};
+      // ========================================================================
+      // PARENT ← BRIDGE MESSAGE LISTENER
+      // ========================================================================
 
-        if (data.type === 'SHRI_KUBER_BRIDGE_READY') {
-          bridgeReady = true;
-          window.SHRI_KUBER_BRIDGE_STATUS = {
-            ready: true,
-            time: new Date().toISOString()
+      window.addEventListener(
+        'message',
+        function (event) {
+          try {
+            if (
+              !iframe ||
+              event.source !==
+                iframe.contentWindow
+            ) {
+              return;
+            }
+
+            var data = event.data || {};
+
+
+            // ------------------------------------------------------------
+            // BRIDGE READY
+            // ------------------------------------------------------------
+
+            if (
+              data.type ===
+              'SHRI_KUBER_BRIDGE_READY'
+            ) {
+              bridgeReady = true;
+
+              window.SHRI_KUBER_BRIDGE_STATUS = {
+                ready: true,
+                iframeLoaded: true,
+                waitingForBridge: false,
+                version:
+                  data.version || '3.0',
+                time:
+                  new Date().toISOString(),
+                error: ''
+              };
+
+              bridgeClientLog(
+                'SUCCESS',
+                'BRIDGE READY received',
+                {
+                  version:
+                    data.version || '3.0',
+                  queueLength:
+                    queue.length
+                }
+              );
+
+              flushQueue();
+
+              return;
+            }
+
+
+            // ------------------------------------------------------------
+            // REQUEST ACKNOWLEDGEMENT
+            // ------------------------------------------------------------
+
+            if (
+              data.type ===
+              'SHRI_KUBER_CALL_ACK'
+            ) {
+              bridgeClientLog(
+                'ACK',
+                'Bridge received backend request',
+                {
+                  requestId:
+                    data.requestId || '',
+                  fn:
+                    data.fn || ''
+                }
+              );
+
+              return;
+            }
+
+
+            // ------------------------------------------------------------
+            // RESULT
+            // ------------------------------------------------------------
+
+            if (
+              data.type !==
+              'SHRI_KUBER_RESULT'
+            ) {
+              return;
+            }
+
+            var requestId =
+              String(
+                data.requestId || ''
+              );
+
+            var item =
+              clearPending(requestId);
+
+            if (!item) {
+              bridgeClientLog(
+                'WARN',
+                'Received result for unknown request',
+                {
+                  requestId:
+                    requestId
+                }
+              );
+
+              return;
+            }
+
+            if (item.timer) {
+              clearTimeout(item.timer);
+            }
+
+            if (data.ok) {
+              bridgeClientLog(
+                'SUCCESS',
+                'Backend request completed',
+                {
+                  requestId:
+                    requestId,
+                  fn:
+                    item.fn
+                }
+              );
+
+              try {
+                item.ok(
+                  data.result
+                );
+              } catch (callbackError) {
+                bridgeClientLog(
+                  'ERROR',
+                  'Success callback crashed',
+                  {
+                    requestId:
+                      requestId,
+                    fn:
+                      item.fn,
+                    message:
+                      callbackError &&
+                      callbackError.message
+                        ? callbackError.message
+                        : String(callbackError)
+                  }
+                );
+              }
+
+            } else {
+              bridgeClientLog(
+                'ERROR',
+                'Backend returned failure',
+                {
+                  requestId:
+                    requestId,
+                  fn:
+                    item.fn,
+                  error:
+                    data.error || null
+                }
+              );
+
+              failItem(
+                item,
+                data.error || {
+                  name:
+                    'BackendError',
+                  message:
+                    'Backend bridge request failed.'
+                }
+              );
+            }
+
+          } catch (e) {
+            bridgeClientLog(
+              'ERROR',
+              'Bridge message handler exception',
+              {
+                message:
+                  e && e.message
+                    ? e.message
+                    : String(e)
+              }
+            );
+          }
+        },
+        false
+      );
+
+
+      // ========================================================================
+      // PUBLIC BACKEND CALL
+      // ========================================================================
+
+      window.shriKuberBackendCall =
+        function (
+          fn,
+          args,
+          ok,
+          fail
+        ) {
+          var success =
+            typeof ok === 'function'
+              ? ok
+              : function () {};
+
+          var failure =
+            typeof fail === 'function'
+              ? fail
+              : function () {};
+
+          if (!configured()) {
+            failure({
+              name:
+                'BridgeConfigurationError',
+              code:
+                'BRIDGE_URL_MISSING',
+              message:
+                'Apps Script Web App URL is not configured. ' +
+                'Set SHRI_KUBER_APPS_SCRIPT_URL in index.html.'
+            });
+
+            return;
+          }
+
+          ensureBridge();
+
+          var requestId =
+            'req_' +
+            Date.now() +
+            '_' +
+            (++requestSeq);
+
+          var item = {
+            requestId:
+              requestId,
+            fn:
+              String(fn || ''),
+            args:
+              Array.isArray(args)
+                ? args
+                : [],
+            ok:
+              success,
+            fail:
+              failure,
+            timer:
+              null,
+            sentAt:
+              0
           };
+
+          pending.set(
+            requestId,
+            item
+          );
+
+          queue.push(
+            item
+          );
+
+          bridgeClientLog(
+            'QUEUE',
+            'Backend request queued',
+            {
+              requestId:
+                requestId,
+              fn:
+                item.fn,
+              bridgeReady:
+                bridgeReady,
+              queueLength:
+                queue.length
+            }
+          );
+
           flushQueue();
-          return;
-        }
-
-        if (data.type !== 'SHRI_KUBER_RESULT') return;
-
-        var item = clearPending(String(data.requestId || ''));
-        if (!item) return;
-
-        if (item.timer) clearTimeout(item.timer);
-
-        if (data.ok) {
-          try { item.ok(data.result); } catch (ignore) {}
-        } else {
-          failItem(item, data.error || {
-            name: 'BackendError',
-            message: 'Backend bridge request failed.'
-          });
-        }
-      });
-
-      window.shriKuberBackendCall = function (fn, args, ok, fail) {
-        var success = typeof ok === 'function' ? ok : function () {};
-        var failure = typeof fail === 'function' ? fail : function () {};
-
-        if (!configured()) {
-          failure(new Error(
-            'Apps Script Web App URL is not configured. Set SHRI_KUBER_APPS_SCRIPT_URL in index.html.'
-          ));
-          return;
-        }
-
-        ensureBridge();
-
-        var requestId = 'req_' + Date.now() + '_' + (++requestSeq);
-        var item = {
-          requestId: requestId,
-          fn: String(fn || ''),
-          args: Array.isArray(args) ? args : [],
-          ok: success,
-          fail: failure,
-          timer: null
         };
 
-        pending.set(requestId, item);
-        queue.push(item);
-        flushQueue();
-      };
 
-      window.shriKuberBridgeIsReady = function () {
-        return bridgeReady === true;
-      };
+      // ========================================================================
+      // PUBLIC BRIDGE STATUS
+      // ========================================================================
 
-      window.addEventListener('load', ensureBridge);
-      if (document.readyState !== 'loading') ensureBridge();
-      else document.addEventListener('DOMContentLoaded', ensureBridge);
+      window.shriKuberBridgeIsReady =
+        function () {
+          return (
+            bridgeReady === true
+          );
+        };
+
+
+      // ========================================================================
+      // INITIALIZATION
+      // ========================================================================
+
+      bridgeClientLog(
+        'INIT',
+        'Frontend bridge module loaded',
+        {
+          version: '3.0'
+        }
+      );
+
+      window.addEventListener(
+        'load',
+        ensureBridge
+      );
+
+      if (
+        document.readyState !==
+        'loading'
+      ) {
+        ensureBridge();
+      } else {
+        document.addEventListener(
+          'DOMContentLoaded',
+          ensureBridge
+        );
+      }
+
     })();
   </script>
   <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js">
