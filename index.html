@@ -14,37 +14,54 @@
 
     (function () {
       'use strict';
+
+      // Robust GitHub Pages -> Apps Script bridge.
+      // The browser NEVER receives Angel/Telegram credentials from this bridge.
       var requestSeq = 0;
       var pending = new Map();
       var queue = [];
       var bridgeReady = false;
       var iframe = null;
       var initStarted = false;
+      var BRIDGE_TIMEOUT_MS = 20000;
+      var BRIDGE_READY_TIMEOUT_MS = 15000;
 
       function configured() {
         var url = String(window.SHRI_KUBER_APPS_SCRIPT_URL || '').trim();
         return /^https:\/\/script\.google\.com\/macros\/s\/[^\s]+\/exec(?:[?].*)?$/.test(url);
       }
 
-      function ensureBridge() {
-        if (initStarted) return;
-        initStarted = true;
-        if (!configured()) return;
+      function appScriptUrl() {
+        return String(window.SHRI_KUBER_APPS_SCRIPT_URL || '').trim();
+      }
 
-        iframe = document.createElement('iframe');
-        iframe.id = 'shriKuberAppsScriptBridge';
-        iframe.title = 'Backend bridge';
-        iframe.setAttribute('aria-hidden', 'true');
-        iframe.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;border:0;opacity:0;pointer-events:none;';
-        iframe.src = window.SHRI_KUBER_APPS_SCRIPT_URL +
-          (window.SHRI_KUBER_APPS_SCRIPT_URL.indexOf('?') >= 0 ? '&' : '?') + 'bridge=1';
-        document.documentElement.appendChild(iframe);
+      function failItem(item, error) {
+        try { if (item && typeof item.fail === 'function') item.fail(error); } catch (ignore) {}
+      }
+
+      function clearPending(requestId) {
+        var item = pending.get(requestId);
+        if (item) pending.delete(requestId);
+        return item;
+      }
+
+      function timeoutRequest(requestId, fn) {
+        var item = clearPending(requestId);
+        if (!item) return;
+        failItem(item, {
+          name: 'BackendTimeout',
+          code: 'BACKEND_TIMEOUT',
+          message: 'Apps Script backend request timed out after ' + BRIDGE_TIMEOUT_MS + ' ms: ' + fn
+        });
       }
 
       function flushQueue() {
         if (!bridgeReady || !iframe || !iframe.contentWindow) return;
+
         while (queue.length) {
           var item = queue.shift();
+          if (!pending.has(item.requestId)) continue;
+
           try {
             iframe.contentWindow.postMessage({
               type: 'SHRI_KUBER_CALL',
@@ -52,30 +69,100 @@
               fn: item.fn,
               args: item.args
             }, '*');
+
+            item.timer = setTimeout(function (requestId, fn) {
+              return function () { timeoutRequest(requestId, fn); };
+            }(item.requestId, item.fn), BRIDGE_TIMEOUT_MS);
+
           } catch (e) {
-            pending.delete(item.requestId);
-            item.fail(e);
+            var failed = clearPending(item.requestId);
+            failItem(failed || item, e);
           }
         }
       }
 
+      function ensureBridge() {
+        if (initStarted) return;
+        initStarted = true;
+
+        if (!configured()) {
+          window.SHRI_KUBER_BRIDGE_STATUS = {
+            ready: false,
+            error: 'Apps Script Web App URL is not configured.'
+          };
+          return;
+        }
+
+        iframe = document.createElement('iframe');
+        iframe.id = 'shriKuberAppsScriptBridge';
+        iframe.title = 'Backend bridge';
+        iframe.setAttribute('aria-hidden', 'true');
+        iframe.style.cssText =
+          'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;' +
+          'border:0;opacity:0;pointer-events:none;';
+
+        iframe.onload = function () {
+          window.SHRI_KUBER_BRIDGE_STATUS = {
+            ready: false,
+            iframeLoaded: true,
+            waitingForBridge: true
+          };
+        };
+
+        iframe.onerror = function () {
+          window.SHRI_KUBER_BRIDGE_STATUS = {
+            ready: false,
+            error: 'Apps Script bridge iframe failed to load.'
+          };
+        };
+
+        var url = appScriptUrl();
+        iframe.src = url +
+          (url.indexOf('?') >= 0 ? '&' : '?') +
+          'bridge=1&_bridge=' + Date.now();
+
+        document.documentElement.appendChild(iframe);
+
+        setTimeout(function () {
+          if (!bridgeReady) {
+            window.SHRI_KUBER_BRIDGE_STATUS = {
+              ready: false,
+              error: 'Bridge did not become ready within ' + BRIDGE_READY_TIMEOUT_MS + ' ms.'
+            };
+          }
+        }, BRIDGE_READY_TIMEOUT_MS);
+      }
+
       window.addEventListener('message', function (event) {
         if (!iframe || event.source !== iframe.contentWindow) return;
+
         var data = event.data || {};
 
         if (data.type === 'SHRI_KUBER_BRIDGE_READY') {
           bridgeReady = true;
+          window.SHRI_KUBER_BRIDGE_STATUS = {
+            ready: true,
+            time: new Date().toISOString()
+          };
           flushQueue();
           return;
         }
 
         if (data.type !== 'SHRI_KUBER_RESULT') return;
-        var cb = pending.get(data.requestId);
-        if (!cb) return;
-        pending.delete(data.requestId);
 
-        if (data.ok) cb.ok(data.result);
-        else cb.fail(data.error || { message: 'Backend bridge request failed.' });
+        var item = clearPending(String(data.requestId || ''));
+        if (!item) return;
+
+        if (item.timer) clearTimeout(item.timer);
+
+        if (data.ok) {
+          try { item.ok(data.result); } catch (ignore) {}
+        } else {
+          failItem(item, data.error || {
+            name: 'BackendError',
+            message: 'Backend bridge request failed.'
+          });
+        }
       });
 
       window.shriKuberBackendCall = function (fn, args, ok, fail) {
@@ -83,15 +170,31 @@
         var failure = typeof fail === 'function' ? fail : function () {};
 
         if (!configured()) {
-          failure(new Error('Apps Script Web App URL is not configured. Set SHRI_KUBER_APPS_SCRIPT_URL in index.html.'));
+          failure(new Error(
+            'Apps Script Web App URL is not configured. Set SHRI_KUBER_APPS_SCRIPT_URL in index.html.'
+          ));
           return;
         }
 
         ensureBridge();
+
         var requestId = 'req_' + Date.now() + '_' + (++requestSeq);
-        pending.set(requestId, { ok: success, fail: failure });
-        queue.push({ requestId: requestId, fn: fn, args: Array.isArray(args) ? args : [], fail: failure });
+        var item = {
+          requestId: requestId,
+          fn: String(fn || ''),
+          args: Array.isArray(args) ? args : [],
+          ok: success,
+          fail: failure,
+          timer: null
+        };
+
+        pending.set(requestId, item);
+        queue.push(item);
         flushQueue();
+      };
+
+      window.shriKuberBridgeIsReady = function () {
+        return bridgeReady === true;
       };
 
       window.addEventListener('load', ensureBridge);
@@ -2343,6 +2446,60 @@
     // ================================================================
     //  EXISTING AUTO-LOGIN
     // ================================================================
+    function verifyBackendAndStart() {
+      log('Testing GitHub → Apps Script backend RPC...', 'api', 'BRIDGE');
+
+      callBackend('testGitHubBridge', [], (res) => {
+        if (!res || res.success !== true) {
+          log(
+            'Backend RPC test failed: ' + ((res && res.message) || 'Unknown backend response.'),
+            'error',
+            'BRIDGE'
+          );
+          setBackendOnlineIndicator(false, 'BACKEND RPC FAILED');
+          return;
+        }
+
+        log(
+          'Backend RPC test successful | ' +
+          (res.time || '') +
+          ' | ' +
+          (res.timezone || 'Asia/Kolkata'),
+          'success',
+          'BRIDGE'
+        );
+        setBackendOnlineIndicator(true, 'SYSTEM ONLINE');
+
+        loadSettings();
+        refreshStrategyList();
+        buildMasterPointsUI();
+        loadTelegramSettingsUI();
+        attemptAutoLogin();
+      }, (err) => {
+        log(
+          'Backend RPC test exception: ' + describeBackendFailure(err),
+          'error',
+          'BRIDGE'
+        );
+        setBackendOnlineIndicator(false, 'BACKEND RPC FAILED');
+      });
+    }
+
+    function setBackendOnlineIndicator(online, text) {
+      var candidates = [
+        document.querySelector('.system-status'),
+        document.querySelector('[data-system-status]'),
+        document.getElementById('systemStatus')
+      ];
+      var el = null;
+      for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i]) { el = candidates[i]; break; }
+      }
+      if (!el) return;
+      el.textContent = (online ? '● ' : '● ') + (text || (online ? 'SYSTEM ONLINE' : 'BACKEND OFFLINE'));
+      el.style.color = online ? '#4caf50' : '#ff6b6b';
+    }
+
     function attemptAutoLogin() {
       // Browser startup login is only a convenience. The real unattended
       // auto-login is performed by the server-side tradeAutoSchedulerTick(),
@@ -4174,19 +4331,43 @@
         $('telegramStatusLabel').style.color = '#f44336';
         return;
       }
-      $('telegramStatusLabel').textContent = '⏳ Saving Telegram...';
+
+      $('telegramStatusLabel').textContent = '⏳ Saving Telegram settings...';
       $('telegramStatusLabel').style.color = '#ffa726';
+
+      // Save credentials first. The activation/test message is a separate RPC,
+      // so a slow Telegram API cannot keep the Save operation blocked forever.
       callBackend('saveTelegramSettings', [token, chatId], (res) => {
         if (res && res.success) {
-          $('telegramStatusLabel').textContent = '🟢 Telegram Active — Activation message sent';
-          $('telegramStatusLabel').style.color = '#4caf50';
           $('telegramBotToken').value = '';
-          log('Telegram notifications activated successfully.', 'success', 'TELEGRAM');
+          $('telegramStatusLabel').textContent = '🟢 Telegram settings saved. Sending activation test...';
+          $('telegramStatusLabel').style.color = '#4caf50';
+          log('Telegram settings saved successfully.', 'success', 'TELEGRAM');
+
+          callBackend('testTelegramMessage', [], (testRes) => {
+            if (testRes && testRes.success) {
+              $('telegramStatusLabel').textContent = '🟢 Telegram Active — Test message sent';
+              $('telegramStatusLabel').style.color = '#4caf50';
+              log('Telegram activation test sent successfully.', 'success', 'TELEGRAM');
+            } else {
+              $('telegramStatusLabel').textContent = '🟡 Telegram saved, but test failed: ' + ((testRes && testRes.message) || 'Unknown Telegram error');
+              $('telegramStatusLabel').style.color = '#ffa726';
+              log('Telegram saved but activation test failed: ' + ((testRes && testRes.message) || 'Unknown error'), 'warn', 'TELEGRAM');
+            }
+          }, (testErr) => {
+            $('telegramStatusLabel').textContent = '🟡 Telegram saved, but test timed out/failed: ' + describeBackendFailure(testErr);
+            $('telegramStatusLabel').style.color = '#ffa726';
+            log('Telegram saved but activation test failed: ' + describeBackendFailure(testErr), 'warn', 'TELEGRAM');
+          });
+
         } else {
           $('telegramStatusLabel').textContent = '❌ ' + ((res && res.message) || 'Telegram save failed');
           $('telegramStatusLabel').style.color = '#f44336';
           log('Telegram save failed: ' + ((res && res.message) || 'Unknown error'), 'error', 'TELEGRAM');
         }
+      }, (err) => {
+        $('telegramStatusLabel').textContent = '❌ Telegram save failed: ' + describeBackendFailure(err);
+        $('telegramStatusLabel').style.color = '#f44336';
       });
     }
 
@@ -5401,12 +5582,10 @@
 
       $('refreshHeaderBtn').addEventListener('click', updateHeader);
 
-      // Load initial data
-      loadSettings();
-      refreshStrategyList();
-      buildMasterPointsUI();
-
-      attemptAutoLogin();
+      // Load initial data only after a real backend RPC succeeds.
+      // This prevents the dashboard from showing SYSTEM ONLINE while every
+      // google.script.run request is actually stuck behind a broken bridge.
+      verifyBackendAndStart();
       setTimeout(() => { initChart(); }, 500);
 
       if (window._strategyMarketWatch) clearInterval(window._strategyMarketWatch);
